@@ -1,231 +1,320 @@
-import React, { useState, useCallback } from 'react';
-import { calculateSequential, validateInputs } from './engine/calculations.js';
-import { HV_PRESET, LV_PRESET } from './engine/presets.js';
-import InputPanel from './components/InputPanel.jsx';
-import ResultCard from './components/ResultCard.jsx';
-import StressChart from './components/StressChart.jsx';
-import VerdictPanel from './components/VerdictPanel.jsx';
-import { exportPDF } from './utils/pdfExport.js';
+import React, { useState, useMemo, useCallback } from 'react';
+import { computeAll, DEFAULT_INPUTS, getStatus, getPct, LIMITS } from './engine/engine.js';
+import ResultsPage from './components/ResultsPage.jsx';
+import Dashboard from './components/Dashboard.jsx';
 
-const TABS = [
-  { id: 'input',   label: '⚡ Input Engine'  },
-  { id: 'results', label: '📊 Results'        },
-  { id: 'chart',   label: '📈 Visualization'  },
-  { id: 'verdict', label: '🛡️ Final Verdict'  },
-];
+// ── Helpers ───────────────────────────────────────────────────────────────
+const STATUS_CFG = {
+  safe:    { label:'SAFE',     cls:'badge-safe',    bar:'bar-safe'     },
+  alert:   { label:'ALERT',    cls:'badge-alert',   bar:'bar-alert'    },
+  critical:{ label:'CRITICAL', cls:'badge-critical',bar:'bar-critical' },
+  info:    { label:'INFO',     cls:'badge-info',    bar:'bar-info'     },
+  pending: { label:'—',        cls:'badge-pending', bar:''             },
+};
 
-const RESULT_ORDER = ['Isc', 'AT', 'hoopStress', 'Ns', 'Fc', 'spacerStress', 'bendingStress', 'Fcrit', 'Fr'];
+function InputBox({ id, label, value, unit, disabled, onChange, error }) {
+  return (
+    <div className={`ib-wrap${error?' ib-error':''}${disabled?' ib-const':''}`}>
+      <label htmlFor={id} className="ib-label">
+        {label}
+        {disabled && <span className="tag-const">CONST</span>}
+        {unit && <span className="ib-unit">{unit}</span>}
+      </label>
+      <input id={id} type="number" step="any" className="ib-input"
+        value={value??''} disabled={disabled}
+        placeholder={disabled?'Constant':'Enter…'}
+        onChange={e=>onChange&&onChange(e.target.value)}/>
+      {error && <div className="ib-err-msg">⚠ {error}</div>}
+    </div>
+  );
+}
 
+function OutputRow({ label, value, unit, statusKey, limitLabel, winding }) {
+  const st  = getStatus(value, statusKey);
+  const pct = getPct(value, statusKey);
+  const cfg = STATUS_CFG[st]??STATUS_CFG.pending;
+  return (
+    <div className={`out-row${value!==null?` out-row--${st}`:''}`}>
+      <div className="out-row__left">
+        {winding && <span className={`out-winding out-winding--${winding.toLowerCase()}`}>{winding}</span>}
+        <span className="out-label">{label}</span>
+      </div>
+      <div className="out-row__right">
+        <span className="out-val">{value!==null&&isFinite(value)?Number(value).toFixed(4):'—'} <span className="out-unit">{unit}</span></span>
+        <span className={`badge ${cfg.cls}`}>{cfg.label}</span>
+      </div>
+      {pct!==null&&(
+        <div className="out-bar-wrap">
+          <div className="out-bar-track">
+            <div className={`out-bar-fill ${cfg.bar}`} style={{width:`${pct}%`}}/>
+            <div className="out-bar-warn-mark"/>
+          </div>
+          <span className="out-pct">{pct.toFixed(1)}%</span>
+          {limitLabel&&<span className="out-limit">{limitLabel}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SectionCard({ id, section, title, formulaText, description, children }) {
+  const [collapsed, setCollapsed] = useState(false);
+  return (
+    <div className="sc-card" id={id}>
+      <div className="sc-header" onClick={()=>setCollapsed(c=>!c)}>
+        <div className="sc-header__left">
+          <span className="sc-badge">{section}</span>
+          <div>
+            <div className="sc-title">{title}</div>
+            <code className="sc-formula">{formulaText}</code>
+          </div>
+        </div>
+        <div className="sc-header__right">
+          <span className="sc-desc">{description}</span>
+          <span className="sc-chevron">{collapsed?'▶':'▼'}</span>
+        </div>
+      </div>
+      {!collapsed&&<div className="sc-body">{children}</div>}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
 export default function App() {
-  const [mode, setMode]         = useState('HV');
-  const [inputs, setInputs]     = useState({ ...HV_PRESET });
-  const [results, setResults]   = useState(null);       // only set on Submit
-  const [errors, setErrors]     = useState([]);         // validation errors
-  const [activeTab, setActiveTab] = useState('input');
+  const [inp, setInp]       = useState({...DEFAULT_INPUTS});
+  const [errors, setErrors] = useState({});
+  const [activeTab, setActiveTab] = useState('calc');
 
-  // ── HV / LV preset switch ──
-  const handleModeChange = useCallback((newMode) => {
-    setMode(newMode);
-    setInputs(newMode === 'HV' ? { ...HV_PRESET } : { ...LV_PRESET });
-    setResults(null);
-    setErrors([]);
-  }, []);
+  const set = useCallback((key)=>(val)=>{
+    setInp(prev=>({...prev,[key]:val===''?'':val}));
+    const num=Number(val);
+    if(val==='') setErrors(p=>({...p,[key]:'Required'}));
+    else if(isNaN(num)) setErrors(p=>({...p,[key]:'Numbers only'}));
+    else setErrors(p=>{const n={...p};delete n[key];return n;});
+  },[]);
 
-  // ── Field change — store raw string, no calculation ──
-  const handleInputChange = useCallback((key, value) => {
-    setInputs((prev) => ({ ...prev, [key]: value }));
-    // Clear errors on edit so user isn't shown stale messages
-    setErrors([]);
-  }, []);
+  const numInp = useMemo(()=>{
+    const o={};
+    Object.entries(inp).forEach(([k,v])=>{o[k]=v===''?null:Number(v);});
+    return o;
+  },[inp]);
 
-  // ── Reset ──
-  const handleReset = useCallback(() => {
-    setInputs(mode === 'HV' ? { ...HV_PRESET } : { ...LV_PRESET });
-    setResults(null);
-    setErrors([]);
-  }, [mode]);
+  const R = useMemo(()=>computeAll(numInp),[numInp]);
 
-  // ── Submit: validate → calculate sequentially ──
-  const handleSubmit = useCallback(() => {
-    const validationErrors = validateInputs(inputs);
-    if (validationErrors.length > 0) {
-      setErrors(validationErrors);
-      setResults(null);         // clear any previous results
-      return;
-    }
-    setErrors([]);
-    const computed = calculateSequential(inputs);
-    setResults(computed);
-    setActiveTab('results');    // auto-navigate to results
-  }, [inputs]);
+  const fld=(key,label,unit,disabled=false)=>(
+    <InputBox id={`inp-${key}`} label={label} unit={unit}
+      value={inp[key]} disabled={disabled}
+      onChange={set(key)} error={errors[key]}/>
+  );
 
-  // ── PDF export ──
-  const handleExport = useCallback(() => {
-    if (results) exportPDF(results, inputs, mode);
-  }, [results, inputs, mode]);
+  const checkedKeys=[
+    {k:'sigmaHV',lk:'sigma'},{k:'sigmaLV',lk:'sigma'},
+    {k:'PHV',lk:'phv'},{k:'PLV',lk:'plv'},
+    {k:'bendHV',lk:'bendHV'},{k:'bendLV',lk:'bendLV'},
+    {k:'clamp',lk:'clamp'}
+  ];
+  const overall = checkedKeys.map(({k,lk})=>getStatus(R[k],lk)).includes('critical')
+    ? 'critical' : checkedKeys.map(({k,lk})=>getStatus(R[k],lk)).includes('alert')
+    ? 'alert' : 'safe';
 
-  const hasResults = results !== null;
+  const TABS=[{id:'calc',label:'⚡ Calculator'},{id:'results',label:'📋 Results'},{id:'dashboard',label:'📊 Dashboard'}];
 
   return (
     <div className="app-shell">
-
-      {/* ── Header ── */}
       <header className="header">
         <div className="header__brand">
           <div className="header__icon">⚡</div>
           <div>
-            <div className="header__title">Transformer SC Intelligence</div>
-            <div className="header__subtitle">9-Layer Physics Engine</div>
+            <div className="header__title">IEEMA Short Circuit Force Calculator</div>
+            <div className="header__subtitle">Tesla Transformers (India) Ltd · 50/60 MVA · 110/33 KV · 9-Formula Real-Time Engine</div>
           </div>
         </div>
-        <div className="header__controls">
-          <div className="toggle-group">
-            <button id="toggle-hv" className={`toggle-btn ${mode === 'HV' ? 'active' : ''}`} onClick={() => handleModeChange('HV')}>HV</button>
-            <button id="toggle-lv" className={`toggle-btn ${mode === 'LV' ? 'active' : ''}`} onClick={() => handleModeChange('LV')}>LV</button>
+        <div className="header__right">
+          <nav className="header-tabs">
+            {TABS.map(t=>(
+              <button key={t.id} className={`header-tab${activeTab===t.id?' header-tab--active':''}`}
+                onClick={()=>setActiveTab(t.id)}>{t.label}</button>
+            ))}
+          </nav>
+          <div className={`overall-badge overall-badge--${overall}`}>
+            {overall==='critical'?'🔴':overall==='alert'?'⚠️':'✅'} {overall.toUpperCase()}
           </div>
-          <button id="btn-reset"  className="btn btn--danger"  onClick={handleReset}>↺ Reset</button>
-          <button id="btn-export" className="btn btn--primary" onClick={handleExport} disabled={!hasResults}>📄 Export PDF</button>
         </div>
       </header>
 
-      {/* ── Main ── */}
-      <main className="main-content" id="pdf-export-target">
+      <main className="main-content">
 
-        {/* Navigation Tabs */}
-        <nav className="nav-tabs">
-          {TABS.map((tab) => (
-            <button
-              key={tab.id}
-              id={`tab-${tab.id}`}
-              className={`nav-tab ${activeTab === tab.id ? 'active' : ''}`}
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </nav>
+        {/* ═══ RESULTS PAGE ═══ */}
+        {activeTab==='results' && <ResultsPage results={R}/>}
 
-        {/* ── Tab: Input ── */}
-        {activeTab === 'input' && (
-          <div className="panel">
-            <div className="panel__header">
-              <span className="panel__title">⚡ Transformer Parameters — {mode} Winding</span>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.65rem', color: 'var(--text-secondary)' }}>
-                Fill all fields, then click Submit
-              </span>
-            </div>
-            <div className="panel__body">
+        {/* ═══ DASHBOARD ═══ */}
+        {activeTab==='dashboard' && <Dashboard results={R}/>}
 
-              {/* Validation error box */}
-              {errors.length > 0 && (
-                <div id="validation-errors" style={{
-                  background: 'var(--danger-bg)',
-                  border: '1px solid var(--danger-border)',
-                  borderRadius: 'var(--radius-md)',
-                  padding: '14px 18px',
-                  marginBottom: '20px',
-                }}>
-                  <div style={{
-                    fontFamily: 'var(--font-display)',
-                    fontSize: '0.68rem',
-                    fontWeight: 700,
-                    color: 'var(--danger-color)',
-                    letterSpacing: '1px',
-                    marginBottom: '8px',
-                  }}>
-                    ❌ VALIDATION ERRORS — Fix before submitting:
-                  </div>
-                  <ul style={{ listStyle: 'none', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                    {errors.map((e, i) => (
-                      <li key={i} style={{
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: '0.78rem',
-                        color: 'var(--danger-color)',
-                      }}>
-                        • {e}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              <InputPanel inputs={inputs} onChange={handleInputChange} />
-
-              {/* Submit Button */}
-              <div style={{ marginTop: '28px', display: 'flex', justifyContent: 'flex-end' }}>
-                <button id="btn-submit" className="btn btn--primary" onClick={handleSubmit}
-                  style={{ padding: '12px 36px', fontSize: '0.75rem', letterSpacing: '2px' }}>
-                  ⚙️ SUBMIT &amp; CALCULATE
-                </button>
-              </div>
-
-            </div>
+        {/* ═══ CALCULATOR ═══ */}
+        {activeTab==='calc' && (
+        <div className="calc-page">
+          <div className="calc-intro">
+            <span className="intro-tag">🔬 Real-Time Calculation — Both HV &amp; LV shown</span>
+            <span>Constants are pre-filled and locked. Outputs update instantly as you type.</span>
           </div>
-        )}
 
-        {/* ── Tab: Results ── */}
-        {activeTab === 'results' && (
-          <div>
-            {hasResults ? (
-              <div className="results-grid">
-                {RESULT_ORDER.map((key) => (
-                  <ResultCard key={key} resultKey={key} value={results[key]} />
-                ))}
-              </div>
-            ) : (
-              <div className="panel">
-                <div className="empty-state">
-                  <div className="empty-state__icon">📊</div>
-                  <div className="empty-state__text">No results yet</div>
-                  <div className="empty-state__hint">Go to Input Engine and click Submit to run the analysis</div>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── Tab: Chart ── */}
-        {activeTab === 'chart' && (
-          <div className="panel">
-            <div className="panel__header">
-              <span className="panel__title">📈 Stress vs Permissible Limits</span>
+          {/* §1.1 ISC */}
+          <SectionCard id="sec11" section="§1.1" title="Short Circuit Peak Current"
+            formulaText="Isc = K√2 × Iph / ez" description="HV & LV first peak current (A)">
+            <div className="input-grid">
+              {fld('iphHV','Phase Current HV (Iph)','A')}
+              {fld('iphLV','Phase Current LV (Iph)','A')}
+              {fld('K2','Peak Factor K√2','',true)}
+              {fld('ez','Impedance (ez)','p.u.',true)}
             </div>
-            <div className="panel__body">
-              {hasResults ? (
-                <StressChart results={results} />
-              ) : (
-                <div className="empty-state">
-                  <div className="empty-state__icon">📈</div>
-                  <div className="empty-state__text">No data to visualize</div>
-                  <div className="empty-state__hint">Submit the analysis first</div>
-                </div>
-              )}
+            <OutputRow label="Isc — HV" value={R.iscHV} unit="A" statusKey="isc" winding="HV"/>
+            <OutputRow label="Isc — LV" value={R.iscLV} unit="A" statusKey="isc" winding="LV"/>
+          </SectionCard>
+
+          {/* §1.2 AT */}
+          <SectionCard id="sec12" section="§1.2" title="Asymmetrical Short Circuit Amp-Turns"
+            formulaText="AT = N × Isc  ← auto-linked from §1.1" description="A·turns HV & LV">
+            <div className="input-grid">
+              {fld('nHV','Turns HV (N','')}
+              {fld('nLV','Turns LV (N)','')}
             </div>
-          </div>
-        )}
+            <div className="autofill-note">⚡ Isc auto-linked from §1.1</div>
+            <OutputRow label="N×Isc — HV" value={R.atHV} unit="A·turns" statusKey="at" winding="HV"/>
+            <OutputRow label="N×Isc — LV" value={R.atLV} unit="A·turns" statusKey="at" winding="LV"/>
+          </SectionCard>
 
-        {/* ── Tab: Verdict ── */}
-        {activeTab === 'verdict' && (
-          <div>
-            {hasResults ? (
-              <VerdictPanel results={results} />
-            ) : (
-              <div className="panel">
-                <div className="empty-state">
-                  <div className="empty-state__icon">🛡️</div>
-                  <div className="empty-state__text">Verdict not available yet</div>
-                  <div className="empty-state__hint">Submit the analysis to see the final verdict</div>
-                </div>
+          {/* §2.0 Hoop Stress */}
+          <SectionCard id="sec20" section="§2.0" title="Hoop Stress (σ_mean)"
+            formulaText="σ = K(cu) × Iph² × Rdc / (hw × ez²)" description="Limit: 1250 kg/cm²">
+            <div className="input-grid">
+              {fld('Kcu','Material Factor K(cu)','',true)}
+              {fld('hw','Winding Height hw','cm')}
+              {fld('rdcHV','Rdc HV @ 75°C','Ω')}
+              {fld('rdcLV','Rdc LV @ 75°C','Ω')}
+            </div>
+            <div className="autofill-note">⚡ Iph & ez auto-linked from §1.1</div>
+            <OutputRow label="σ_mean — HV" value={R.sigmaHV} unit="kg/cm²" statusKey="sigma" limitLabel="Limit: 1250" winding="HV"/>
+            <OutputRow label="σ_mean — LV" value={R.sigmaLV} unit="kg/cm²" statusKey="sigma" limitLabel="Limit: 1250" winding="LV"/>
+          </SectionCard>
+
+          {/* §3.0 Supports */}
+          <SectionCard id="sec30" section="§3.0" title="No. of Supports — LV Winding"
+            formulaText="Ns = Dmi × √(12×σ_LV/E) / bi" description="σ_LV auto-linked from §2.0">
+            <div className="input-grid">
+              {fld('Dmi','Mean Diameter LV Dmi','cm')}
+              {fld('bi','Insul. Thickness bi','cm')}
+              {fld('Emod',"Young's Modulus E",'kg/cm²',true)}
+            </div>
+            <div className="autofill-note">⚡ σ_LV auto-linked from §2.0</div>
+            <OutputRow label="Ns — Required Supports (LV)" value={R.Ns} unit="nos." statusKey="ns"/>
+          </SectionCard>
+
+          {/* §4.0 Axial Compression */}
+          <SectionCard id="sec40" section="§4.0" title="Internal Axial Compression (Fc)"
+            formulaText="Fc = 34 × Sn / (ez × hw)" description="ez & hw auto-linked">
+            <div className="input-grid">
+              {fld('Sn','Equiv. kVA — 3-phase (Sn)','kVA')}
+            </div>
+            <div className="autofill-note">⚡ ez & hw auto-linked from §1.1, §2.0</div>
+            <OutputRow label="Fc — Axial Compression" value={R.Fc} unit="kg" statusKey="fc"/>
+            {R.Fc&&<div className="out-note">= {(R.Fc/1000).toFixed(3)} MT</div>}
+          </SectionCard>
+
+          {/* §5.0 Spacer Stress */}
+          <SectionCard id="sec50" section="§5.0" title="Compressive Stress in Radial Spacers"
+            formulaText="P = (Fa + Ks×Fc) / A" description="Limit: 500 kg/cm²">
+            <div className="input-grid">
+              {fld('ksHV','Sharing Factor HV (Ks)','')}
+              {fld('ksLV','Sharing Factor LV (Ks)','')}
+              {fld('Fa','Pre-stress Force Fa','kg')}
+              {fld('AHV','HV Spacer Area AHV','cm²')}
+              {fld('ALV','LV Spacer Area ALV','cm²')}
+            </div>
+            <div className="autofill-note">⚡ Fc auto-linked from §4.0</div>
+            <OutputRow label="PHV — HV Radial Spacer" value={R.PHV} unit="kg/cm²" statusKey="phv" limitLabel="Limit: 500" winding="HV"/>
+            <OutputRow label="PLV — LV Radial Spacer" value={R.PLV} unit="kg/cm²" statusKey="plv" limitLabel="Limit: 500" winding="LV"/>
+          </SectionCard>
+
+          {/* §6.0 Axial Bending */}
+          <SectionCard id="sec60" section="§6.0" title="Axial Bending Stress in Conductor"
+            formulaText="σ_b = W × L² × Y / (24 × Io)  [CORRECTED]" description="Limit: 1250 kg/cm²">
+            <div className="input-grid">
+              {fld('W_hv','Bending Force W (HV)','kg')}
+              {fld('W_lv','Bending Force W (LV)','kg')}
+              {fld('L_hv','Span Length L (HV)','cm')}
+              {fld('L_lv','Span Length L (LV)','cm')}
+              {fld('Y_hv','Neutral Axis Y (HV)','cm')}
+              {fld('Y_lv','Neutral Axis Y (LV)','cm')}
+              {fld('Io_hv','Moment of Inertia Io (HV)','cm⁴')}
+              {fld('Io_lv','Moment of Inertia Io (LV)','cm⁴')}
+            </div>
+            <OutputRow label="Max Fibre Stress — HV" value={R.bendHV} unit="kg/cm²" statusKey="bendHV" limitLabel="Limit: 1250" winding="HV"/>
+            <OutputRow label="Max Fibre Stress — LV" value={R.bendLV} unit="kg/cm²" statusKey="bendLV" limitLabel="Limit: 1250" winding="LV"/>
+          </SectionCard>
+
+          {/* §7.0 Tilting */}
+          <SectionCard id="sec70" section="§7.0" title="Tilting of Conductors — F(crit)"
+            formulaText="F(crit) = FT + FF  [Safety: F(crit) > Ks×Fc]" description="Resistance to tilting">
+            <div className="input-grid">
+              {fld('FT_hv','Axial Strength FT (HV)','MT')}
+              {fld('FF_hv','Friction Force FF (HV)','MT')}
+              {fld('FT_lv','Axial Strength FT (LV)','MT')}
+              {fld('FF_lv','Friction Force FF (LV)','MT')}
+            </div>
+            <div className="autofill-note">⚡ Ks & Fc auto-linked from §4.0–§5.0</div>
+            <div className="out-row">
+              <div className="out-row__left"><span className="out-winding out-winding--hv">HV</span><span className="out-label">F(crit) — HV</span></div>
+              <div className="out-row__right">
+                <span className="out-val">{R.FcritHV!==null?R.FcritHV.toFixed(2):'—'} <span className="out-unit">MT</span></span>
+                <span className={`badge ${R.tiltSafeHV===null?'badge-pending':R.tiltSafeHV?'badge-safe':'badge-critical'}`}>
+                  {R.tiltSafeHV===null?'—':R.tiltSafeHV?'SAFE':'CRITICAL'}
+                </span>
               </div>
-            )}
-          </div>
-        )}
+            </div>
+            <div className="out-row">
+              <div className="out-row__left"><span className="out-winding out-winding--lv">LV</span><span className="out-label">F(crit) — LV</span></div>
+              <div className="out-row__right">
+                <span className="out-val">{R.FcritLV!==null?R.FcritLV.toFixed(2):'—'} <span className="out-unit">MT</span></span>
+                <span className={`badge ${R.tiltSafeLV===null?'badge-pending':R.tiltSafeLV?'badge-safe':'badge-critical'}`}>
+                  {R.tiltSafeLV===null?'—':R.tiltSafeLV?'SAFE':'CRITICAL'}
+                </span>
+              </div>
+            </div>
+          </SectionCard>
 
+          {/* §8.0 Clamping Ring */}
+          <SectionCard id="sec80" section="§8.0" title="Bending Stress on Clamping Ring"
+            formulaText="σ_max = 6π × F × D / (8 × br × t² × n²)  [CORRECTED]" description="Limit: 1150 kg/cm²">
+            <div className="input-grid">
+              {fld('Fclamp','Total Axial Force F','kg')}
+              {fld('Dclamp','Mean Diameter D','cm')}
+              {fld('brClamp','Ring Width br','cm')}
+              {fld('tClamp','Ring Thickness t','cm')}
+              {fld('nClamp','Clamping Points n','')}
+            </div>
+            <OutputRow label="σ_max — Clamping Ring" value={R.clamp} unit="kg/cm²" statusKey="clamp" limitLabel="Limit: 1150"/>
+          </SectionCard>
+
+          {/* §9.0 Radial Bursting */}
+          <SectionCard id="sec90" section="§9.0" title="Radial Bursting Force (Fr)"
+            formulaText="Fr = 2π × σ_mean × Iph × N / δ" description="σ, Iph, N auto-linked">
+            <div className="input-grid">
+              {fld('deltaHV','Current Density δ (HV)','A/cm²')}
+              {fld('deltaLV','Current Density δ (LV)','A/cm²')}
+            </div>
+            <div className="autofill-note">⚡ σ, Iph, N auto-linked from §1.1, §2.0</div>
+            <OutputRow label="Fr — HV" value={R.frHV} unit="kg" statusKey="frHV" winding="HV"/>
+            {R.frHV&&<div className="out-note">HV: {(R.frHV/1000).toFixed(3)} MT</div>}
+            <OutputRow label="Fr — LV" value={R.frLV} unit="kg" statusKey="frLV" winding="LV"/>
+            {R.frLV&&<div className="out-note">LV: {(R.frLV/1000).toFixed(3)} MT</div>}
+          </SectionCard>
+
+        </div>
+        )}
       </main>
 
-      {/* ── Footer ── */}
       <footer className="footer">
-        <span>Transformer SC Intelligence System</span> — IEEMA Standards · 9-Layer Physics Engine · {new Date().getFullYear()}
+        <span>IEEMA Short Circuit Force Calculator</span> — Tesla Transformers (India) Ltd · 9-Formula Engine · {new Date().getFullYear()}
       </footer>
     </div>
   );
